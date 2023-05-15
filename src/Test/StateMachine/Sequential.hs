@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE BangPatterns          #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -52,6 +53,8 @@ module Test.StateMachine.Sequential
   , checkCommandNames
   , showLabelledExamples
   , showLabelledExamples'
+  , StdOutput (..)
+  , capture, hCapture, goBracket
   )
   where
 
@@ -86,7 +89,7 @@ import           Data.TreeDiff
                    (ToExpr, ansiWlBgEditExprCompact, ediff)
 import           Prelude
 import           System.Directory
-                   (createDirectoryIfMissing)
+                   (createDirectoryIfMissing, removeFile, getTemporaryDirectory)
 import           System.FilePath
                    ((</>))
 import           System.Random
@@ -110,6 +113,7 @@ import           UnliftIO
                    tryReadTChan, writeTChan)
 import           UnliftIO.Exception (throwIO)
 
+import           Test.StateMachine.Capture
 import           Test.StateMachine.ConstructorName
 import           Test.StateMachine.Labelling
                    (Event(..), execCmds)
@@ -118,6 +122,8 @@ import           Test.StateMachine.Types
 import qualified Test.StateMachine.Types.Rank2     as Rank2
 import           Test.StateMachine.Utils
 
+import System.IO
+import Control.DeepSeq
 ------------------------------------------------------------------------
 
 forAllCommands :: Testable prop
@@ -325,7 +331,7 @@ runCommands :: (Show (cmd Concrete), Show (resp Concrete))
             => (MonadMask m, MonadIO m)
             => StateMachine model cmd m resp
             -> Commands cmd resp
-            -> PropertyM m (History cmd resp, model Concrete, Reason)
+            -> PropertyM m (StdOutput, History cmd resp, model Concrete, Reason)
 runCommands sm = runCommandsWithSetup (pure sm)
 
 runCommandsWithSetup :: (Show (cmd Concrete), Show (resp Concrete))
@@ -333,7 +339,7 @@ runCommandsWithSetup :: (Show (cmd Concrete), Show (resp Concrete))
                      => (MonadMask m, MonadIO m)
                      => m (StateMachine model cmd m resp)
                      -> Commands cmd resp
-                     -> PropertyM m (History cmd resp, model Concrete, Reason)
+                     -> PropertyM m (StdOutput, History cmd resp, model Concrete, Reason)
 runCommandsWithSetup msm cmds = run $ runCommands' msm cmds
 
 runCommands' :: (Show (cmd Concrete), Show (resp Concrete))
@@ -341,21 +347,35 @@ runCommands' :: (Show (cmd Concrete), Show (resp Concrete))
              => (MonadMask m, MonadIO m)
              => m (StateMachine model cmd m resp)
              -> Commands cmd resp
-             -> m (History cmd resp, model Concrete, Reason)
+             -> m (StdOutput, History cmd resp, model Concrete, Reason)
 runCommands' msm cmds = do
   hchan <- newTChanIO
-  (reason, (_, _, _, model)) <-
+  (output, reason, (_, _, _, model)) <-
     fst <$> generalBracket
-              msm
-              (\sm' ec -> case ec of
-                            ExitCaseSuccess (_, (_,_,_,model)) -> cleanup sm' model
+              (do
+                  sm <- msm
+                  (fp, h) <- liftIO $ do
+                    d <- getTemporaryDirectory
+                    openTempFile d "capture"
+                  pure (sm, fp, h)
+              )
+              (\(sm', fp, h) ec -> do
+                  liftIO $ hClose h >> removeFile fp
+                  case ec of
+                            ExitCaseSuccess (_, _, (_,_,_,model)) -> cleanup sm' model
                             _ -> getChanContents hchan >>= cleanup sm' . mkModel sm' . History
               )
-              (\sm'@StateMachine{ initModel } -> runStateT
-                       (executeCommands sm' hchan (Pid 0) CheckEverything cmds)
-                       (emptyEnvironment, initModel, newCounter, initModel))
+              (\(sm'@StateMachine{ initModel }, _, h) -> do
+                  (reason, results) <- runStateT
+                       (capture h $ executeCommands sm' hchan (Pid 0) CheckEverything cmds)
+                       (emptyEnvironment, initModel, newCounter, initModel)
+
+                  liftIO $ hFlush h >> hSeek h AbsoluteSeek 0
+                  str <- liftIO $ hGetContents h
+                  str `deepseq` return (StdOutput str, reason, results)
+              )
   hist <- getChanContents hchan
-  return (History hist, model, reason)
+  return (output, History hist, model,  reason)
 
 -- We should try our best to not let this function fail,
 -- since it is used to cleanup resources, in parallel programs.
@@ -373,18 +393,19 @@ data Check
   | CheckEverything
   | CheckNothing
 
-executeCommands :: (Show (cmd Concrete), Show (resp Concrete))
+executeCommands :: forall cmd resp model m. (Show (cmd Concrete), Show (resp Concrete))
                 => (Rank2.Traversable cmd, Rank2.Foldable resp)
-                => (MonadCatch m, MonadIO m)
+                => (MonadMask m, MonadIO m)
                 => StateMachine model cmd m resp
                 -> TChan (Pid, HistoryEvent cmd resp)
                 -> Pid
                 -> Check
                 -> Commands cmd resp
                 -> StateT (Environment, model Symbolic, Counter, model Concrete) m Reason
-executeCommands StateMachine {..} hchan pid check =
-  go . unCommands
+executeCommands StateMachine {..} hchan pid check = do
+    go . unCommands
   where
+    go :: [Command cmd resp1] -> StateT (Environment, model Symbolic, Counter, model Concrete) m Reason
     go []                           = return Ok
     go (Command scmd _ vars : cmds) = do
       (env, smodel, counter, cmodel) <- get
@@ -467,13 +488,26 @@ prettyPrintHistory :: forall model cmd m resp. ToExpr (model Concrete)
                    => (Show (cmd Concrete), Show (resp Concrete))
                    => StateMachine model cmd m resp
                    -> History cmd resp
+                   -> StdOutput
                    -> IO ()
-prettyPrintHistory StateMachine { initModel, transition }
-  = PP.putDoc
-  . go initModel Nothing
-  . makeOperations
-  . unHistory
+prettyPrintHistory StateMachine { initModel, transition } history stdOutput
+  = PP.putDoc $
+    ppHistoryOutput <> ppStdOutput
   where
+    ppStdOutput :: Doc
+    ppStdOutput = mconcat
+      [ PP.line
+      , PP.string "The stdout and stderr of the failing test case was:\n"
+      , PP.indent 2 $ PP.red $ PP.string (getStdOutput stdOutput)
+      , PP.line
+      ]
+
+    ppHistoryOutput :: Doc
+    ppHistoryOutput = go initModel Nothing
+                    . makeOperations
+                    . unHistory
+                    $ history
+
     go :: model Concrete -> Maybe (model Concrete) -> [Operation cmd resp] -> Doc
     go current previous [] =
       PP.line <> modelDiff current previous <> PP.line <> PP.line
@@ -512,9 +546,10 @@ prettyCommands :: (MonadIO m, ToExpr (model Concrete))
                => (Show (cmd Concrete), Show (resp Concrete))
                => StateMachine model cmd m resp
                -> History cmd resp
+               -> StdOutput
                -> Property
                -> PropertyM m ()
-prettyCommands sm hist prop = prettyPrintHistory sm hist `whenFailM` prop
+prettyCommands sm hist output prop = prettyPrintHistory sm hist output `whenFailM` prop
 
 prettyPrintHistory' :: forall model cmd m resp tag. ToExpr (model Concrete)
                     => (Show (cmd Concrete), Show (resp Concrete), ToExpr tag)
@@ -605,11 +640,11 @@ runSavedCommands :: (Show (cmd Concrete), Show (resp Concrete))
                  => (Read (cmd Symbolic), Read (resp Symbolic))
                  => StateMachine model cmd m resp
                  -> FilePath
-                 -> PropertyM m (Commands cmd resp, History cmd resp, model Concrete, Reason)
+                 -> PropertyM m (StdOutput, Commands cmd resp, History cmd resp, model Concrete, Reason)
 runSavedCommands sm fp = do
   cmds <- read <$> liftIO (readFile fp)
-  (hist, model, res) <- runCommands sm cmds
-  return (cmds, hist, model, res)
+  (output, hist, model, res) <- runCommands sm cmds
+  return (output, cmds, hist, model, res)
 
 ------------------------------------------------------------------------
 

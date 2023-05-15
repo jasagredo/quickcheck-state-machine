@@ -397,8 +397,8 @@ prop_sequential :: forall t.
 prop_sequential sm@StateMachineTest{..} mMinSize =
     forAllCommands sm' mMinSize $ \cmds ->
       monadicIO $ do
-        (hist, _model, res) <- runCommands sm' cmds
-        prettyCommands sm' hist
+        (output, hist, _model, res) <- runCommands sm' cmds
+        prettyCommands sm' hist output
           $ tabulate "Tags" (map show $ tagCmds cmds)
           $ res === Ok
   where

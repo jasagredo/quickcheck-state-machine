@@ -22,8 +22,11 @@ module MemoryReference
   , prop_pairs_shrink_parallel_equivalence
   , prop_pairs_shrinkAndValidate_equivalence
   , prop_pairs_shrink_parallel
+  , semantics
   )
   where
+
+import System.IO (hPutStrLn, stderr)
 
 import           Control.Concurrent
                    (threadDelay)
@@ -135,9 +138,15 @@ data Bug
 
 semantics :: Bug -> Command Concrete -> IO (Response Concrete)
 semantics bug cmd = case cmd of
-  Create        -> Created     <$> (reference . Opaque <$> newIORef 0)
-  Read ref      -> ReadValue   <$> readIORef  (opaque ref)
-  Write ref i   ->
+  Create        -> do
+    putStrLn "Create"
+    Created     <$> (reference . Opaque <$> newIORef 0)
+  Read ref      -> do
+    v <- ReadValue   <$> readIORef  (opaque ref)
+    putStrLn $ "Reading: " <> show v
+    pure v
+  Write ref i   -> do
+    putStrLn $ "Write: " <> show i
     case bug of
 
       -- One of the problems is a bug that writes a wrong value to the
@@ -160,6 +169,7 @@ semantics bug cmd = case cmd of
 
       _otherwise -> Written <$ writeIORef (opaque ref) i
   Increment ref -> do
+    putStrLn "Incrementing"
     -- Another problem is that we introduce a possible race condition
     -- when incrementing.
     if bug == Race
@@ -203,16 +213,16 @@ sm bug = StateMachine initModel transition precondition postcondition
 
 prop_sequential :: Bug -> Property
 prop_sequential bug = forAllCommands sm' Nothing $ \cmds -> monadicIO $ do
-  (hist, _model, res) <- runCommands sm' cmds
-  prettyCommands sm' hist (saveCommands "/tmp" cmds
+  (output, hist, _model, res) <- runCommands sm' cmds
+  prettyCommands sm' hist output (saveCommands "/tmp" cmds
                              (coverCommandNames cmds $ checkCommandNames cmds (res === Ok)))
     where
       sm' = sm bug
 
 prop_runSavedCommands :: Bug -> FilePath -> Property
 prop_runSavedCommands bug fp = monadicIO $ do
-  (_cmds, hist, _model, res) <- runSavedCommands (sm bug) fp
-  prettyCommands (sm bug) hist (res === Ok)
+  (output, _cmds, hist, _model, res) <- runSavedCommands (sm bug) fp
+  prettyCommands (sm bug) hist output (res === Ok)
 
 prop_parallel :: Bug -> Property
 prop_parallel bug = forAllParallelCommands sm' Nothing $
@@ -242,8 +252,8 @@ prop_nparallel bug np = forAllNParallelCommands sm' np $ \cmds ->
 
 prop_precondition :: Property
 prop_precondition = once $ monadicIO $ do
-  (hist, _model, res) <- runCommands sm' cmds
-  prettyCommands sm' hist
+  (output, hist, _model, res) <- runCommands sm' cmds
+  prettyCommands sm' hist output
     (res === PreconditionFailed "PredicateC (NotMember (Reference (Symbolic (Var 0))) [])")
     where
       sm'  = sm None
@@ -252,8 +262,8 @@ prop_precondition = once $ monadicIO $ do
 
 prop_existsCommands :: Property
 prop_existsCommands = existsCommands sm' gens $ \cmds -> monadicIO $ do
-  (hist, _model, res) <- runCommands sm' cmds
-  prettyCommands sm' hist (checkCommandNames cmds (res === Ok))
+  (output, hist, _model, res) <- runCommands sm' cmds
+  prettyCommands sm' hist output (checkCommandNames cmds (res === Ok))
   where
     sm'  = sm None
     gens =
