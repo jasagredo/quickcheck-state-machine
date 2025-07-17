@@ -1,3 +1,7 @@
+#### 0.10.2 (2025-07-17)
+
+* Bump upper bound of QuickCheck to allow 2.16.
+
 #### 0.10.1 (2024-09-05)
 
 * Bump upper bounds of outdated dependencies.
